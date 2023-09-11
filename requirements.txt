@@ -5,6 +5,7 @@ equinox
 optax
 evosax
 evojax
+tensorboard  # to log experiments
 
 # --------- hydra --------- #
 hydra-core==1.3.1

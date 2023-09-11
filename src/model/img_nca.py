@@ -22,20 +22,22 @@ class State(NamedTuple):
 
 class ImageNCA(eqx.Module):
     """
-    Neural Cellular Automata for image generation based on Mordintsev et al., (2021).
+    Neural Cellular Automata for image generation based on Mordvintsev et al., (2020).
 
     It grows images by using cellular automatas describing the color channels in each cell with
     the update rules being instantiated using parameterized neural networks. To generate different
-    images, the target class can be fed as input to the model as in Sudhakaran et al., (2023).
+    images, the target class can be fed as input to the model as in Sudhakaran et al., (2022).
 
     Args:
         img_size: size of the target image.
         filter: module that determines how information is shared amongst units.
-        goal_encoder: used to produce the encoding of the target class.
+        target_encoderr: used to produce the encoding of the target class.
         update_rule: function to perform state updates.
         update_prob: probability of performing an an update.
         alive_threshold: value of alive value beyond which a unit is considered part of the target
                          image or left empty.
+        generation_steps: the number of steps used for generation. If a range, a value will be
+                          sampled within its limits.
 
     """
     img_size: Tuple[int, int]
@@ -90,6 +92,9 @@ class ImageNCA(eqx.Module):
 
         g_steps = self.sample_generation_steps(steps_key)
         init_state = self.init_state(state_key)
+        target_emb = self.target_embedding(inputs)
+        # NOTE: Revert back to this if above idea does not work
+        # target_emb = self.target_encoder(inputs)[..., jnp.newaxis, jnp.newaxis]  # tiling
 
         def f(carry: State, _):
             iter, cell_states, key = carry
@@ -99,8 +104,8 @@ class ImageNCA(eqx.Module):
             cell_states = lax.cond(
                 iter < g_steps,
                 self.update_cell_states,
-                lambda cg, _: cg,
-                cell_states, s_key
+                lambda cg, *_: cg,
+                cell_states, target_emb, s_key
             )
 
             return State(iter + 1, cell_states, c_key), cell_states[:4]
@@ -110,6 +115,11 @@ class ImageNCA(eqx.Module):
         # image at target generation step, full output history and final state
         return outputs[g_steps], outputs, final_state
 
+    def init_state(self, key) -> State:
+        H, W = self.img_size
+        cell_states = jnp.zeros((self.state_size, *self.img_size)).at[3:, H // 2, W // 2].set(1.0)
+        return State(0, cell_states, key)
+
     def sample_generation_steps(self, key: jr.PRNGKeyArray):
         return lax.cond(
             self.training,
@@ -118,18 +128,23 @@ class ImageNCA(eqx.Module):
             key
         )
 
-    def init_state(self, key) -> State:
-        H, W = self.img_size
-        cell_states = jnp.zeros((self.state_size, *self.img_size)).at[3:, H // 2, W // 2].set(1.0)
-        return State(0, cell_states, key)
+    def target_embedding(self, inputs):
+        emb = self.target_encoder(inputs)
+        emb = jnp.concatenate((jnp.zeros((4,)), emb), axis=0)  # assume RGBA channels are missing
 
-    def update_cell_states(self, cell_states, s_key):
+        # NOTE: It might be better to just mask out the channel dimensions.
+        # mask = jnp.repeat(jnp.asarray([0, 1]), jnp.asarray([4, self.state_size - 4]))
+        # emb = self.target_encoder(inputs) * mask
+
+        return emb[..., jnp.newaxis, jnp.newaxis]  # tile via broadcasting
+
+    def update_cell_states(self, cell_states, target_emb, s_key):
         # NOTE: This pre alive mask is not described in the article. I imagine it helps with
         # stability. Notice that because the mask is computed using pooling this does not
         # prevent the NCA from growing correctly.
         pre_alive_mask =  self.alive_mask(cell_states)
 
-        perception_vector = self.perceieve(cell_states)
+        perception_vector = self.perceieve(cell_states + target_emb * pre_alive_mask)
         updates = self.update_rule(perception_vector)
         new_states = cell_states + updates * self.stochastic_update_mask(s_key)
 
@@ -146,7 +161,7 @@ class ImageNCA(eqx.Module):
 
     def alive_mask(self, cell_states):
         # Take the alpha channel as the measure of how alive a cell is.
-        return (self.max_pool(cell_states[3:4]) > self.alive_threshold)
+        return self.max_pool(cell_states[3:4]) > self.alive_threshold
 
     def train(self, mode=True):
         return eqx.tree_at(lambda x: x.training, self, mode)
