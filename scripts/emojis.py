@@ -85,7 +85,7 @@ def main(
 
 def seed_everything(seed=None):
     np_rng = np.random.default_rng(seed)
-    jax_key = jax.random.PRNGKey(np_rng.integers(0, 2 ** 32 - 1))
+    jax_key = jax.random.key(np_rng.integers(0, 2 ** 32 - 1))
     return np_rng, jax_key
 
 
@@ -122,13 +122,13 @@ def train(
     if grad_accum > 1:
         optim = optax.MultiSteps(optim, every_k_schedule=grad_accum)
 
-    jax_key = jr.PRNGKey(rng.integers(0, 2 ** 32 -1))
+    jax_key = jr.key(rng.integers(0, 2 ** 32 -1))
     opt_state = optim.init(eqx.filter(model, eqx.is_array))
 
     @eqx.filter_jit
     def make_step(
         model: ImageNCA,
-        key: jr.PRNGKeyArray,
+        key: jax.Array,
         opt_state: PyTree,
         x: Float[Array, "B 1"],
         y: Int[Array, "B 4 H W"],
@@ -174,7 +174,7 @@ def evaluate(
     model = model.eval()
     total_loss, total_examples = 0.0, 0
 
-    jax_key = jr.PRNGKey(rng.integers(0, 2 ** 32 - 1))
+    jax_key = jr.key(rng.integers(0, 2 ** 32 - 1))
 
     for _, (x, y) in zip(range(iters), infinite_trainloader(loader)):
         jax_key, step_key = jr.split(jax_key, 2)
@@ -189,7 +189,7 @@ def create_model(
     n_targets,
     hidden_state_size: int,
     use_sobel_filter: bool,
-    key: jr.PRNGKeyArray
+    key: jax.Array
 ):
     state_size = hidden_state_size + 3 + 1
 
@@ -265,7 +265,7 @@ def infinite_trainloader(loader: JaxLoader):
         yield from loader
 
 
-def compute_loss(model: Callable, loss: Callable, x: Array, y: Array, key: jr.PRNGKeyArray):
+def compute_loss(model: Callable, loss: Callable, x: Array, y: Array, key: jax.Array):
     batch_key = jr.split(key, x.shape[0])
     preds, _, _ = jax.vmap(model)(x, batch_key)
     return jnp.sum(loss(preds, y)) / len(y)
@@ -308,7 +308,7 @@ def visualization(
     inputs = jnp.stack(inputs)
 
     for (n, i) in zip(names, inputs):
-        key = jr.PRNGKey(rng.integers(0, 2 ** 32 - 1))
+        key = jr.key(rng.integers(0, 2 ** 32 - 1))
 
         output, gen_steps, _ = model(i, key)
 

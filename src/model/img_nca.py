@@ -17,7 +17,7 @@ GEN_STEPS = Float[Array, "G S H W"]  # where G is number of generation steps and
 class State(NamedTuple):
     iter: int
     cell_states: jax.Array
-    rng_key: jr.PRNGKeyArray
+    rng_key: jax.Array
 
 
 class ImageNCA(eqx.Module):
@@ -85,7 +85,7 @@ class ImageNCA(eqx.Module):
     def __call__(
         self,
         inputs: TARGET_CLASS,
-        rng_key: jr.PRNGKeyArray
+        rng_key: jax.Array,
     ) -> Tuple[IMAGE, GEN_STEPS, State]:
         # TODO: inputs are not used as this would only be relevant for the goal-directed version
         steps_key, state_key = jr.split(rng_key, 2)
@@ -101,11 +101,11 @@ class ImageNCA(eqx.Module):
             c_key, s_key = jr.split(key)
 
             # only update the states if we have not surpassed the generation_steps
-            cell_states = lax.cond(
+            updated_state = self.update_cell_states(cell_states, target_emb, s_key)
+            cell_states = lax.select(
                 iter < g_steps,
-                self.update_cell_states,
-                lambda cg, *_: cg,
-                cell_states, target_emb, s_key
+                updated_state,
+                cell_states,
             )
 
             return State(iter + 1, cell_states, c_key), cell_states[:4]
@@ -120,7 +120,7 @@ class ImageNCA(eqx.Module):
         cell_states = jnp.zeros((self.state_size, *self.img_size)).at[3:, H // 2, W // 2].set(1.0)
         return State(0, cell_states, key)
 
-    def sample_generation_steps(self, key: jr.PRNGKeyArray):
+    def sample_generation_steps(self, key: jax.Array):
         return lax.cond(
             self.training,
             lambda k: jr.randint(k, (1,), *self.generation_steps).squeeze(),  # reduce to a scalar
@@ -156,7 +156,7 @@ class ImageNCA(eqx.Module):
         filter_grid = self.filter(cell_states)
         return jnp.concatenate([cell_states, filter_grid], axis=0)
 
-    def stochastic_update_mask(self, key: jr.PRNGKeyArray):
+    def stochastic_update_mask(self, key: jax.Array):
         return jr.bernoulli(key, self.update_prob, self.img_size)[jnp.newaxis].astype(jnp.float32)
 
     def alive_mask(self, cell_states):
