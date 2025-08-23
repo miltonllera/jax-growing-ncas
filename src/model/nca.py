@@ -37,6 +37,7 @@ class GrowingNCA(eqx.Module):
         alive_threshold = 0.1,
         alive_index = 3,
         num_dev_steps = (48, 96),
+        bound_updates = False,
         *,
         key
     ) -> None:
@@ -75,9 +76,10 @@ class GrowingNCA(eqx.Module):
                 nn.Lambda(jax.nn.relu),
             ])
             layer_input_size = update_width
-        layers.append(
-            nn.Conv2d(layer_input_size, state_size, kernel_size=1, key=update_key)
-        )
+
+        layers.append(nn.Conv2d(layer_input_size, state_size, kernel_size=1, key=update_key))
+        if bound_updates:
+            layers.append(nn.Lambda(jax.nn.tanh))
 
         update_fn = GrowingUpdate(
             nn.Sequential(layers),
@@ -126,6 +128,7 @@ class NoiseNCA(eqx.Module):
         update_depth = 1,
         update_prob = 0.5,
         num_dev_steps = (48, 96),
+        bound_updates = False,
         *,
         key
     ) -> None:
@@ -164,9 +167,10 @@ class NoiseNCA(eqx.Module):
                 nn.Lambda(jax.nn.relu),
             ])
             layer_input_size = update_width
-        layers.append(
-            nn.Conv2d(layer_input_size, state_size, kernel_size=1, key=update_key)
-        )
+
+        layers.append(nn.Conv2d(layer_input_size, state_size, kernel_size=1, key=update_key))
+        if bound_updates:
+            layers.append(nn.Lambda(jax.nn.sigmoid))
 
         update_fn = SimpleUpdate(nn.Sequential(layers), update_prob)
 

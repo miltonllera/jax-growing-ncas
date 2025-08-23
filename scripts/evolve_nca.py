@@ -4,12 +4,12 @@ import logging
 from pathlib import Path
 from functools import partial
 
-import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import equinox as eqx
 import optax
+import evosax.algorithms as es
 from tqdm import tqdm
 from typing import Callable
 from jaxtyping import Array, Float, PyTree
@@ -29,19 +29,16 @@ def main(
     model: str,
     perception_type: str,
     target,
-    train_iters: int,
-    lr: float,
+    evo_iters: int,
+    pop_size: float,
     save_folder: Path,
     seed: int | None,
 ):
     _, key = seed_everything(seed)
 
     # Set training data
-
-    _logger.info("Loading dataset...")
-
-    target = load_emoji(Emoji[target.upper()].value, 64)
-    target = target[None].repeat(8, axis=0).transpose(0, 3, 1, 2)
+    _logger.info("Loading target example...")
+    target = load_emoji(Emoji[target.upper()].value, 64).transpose(2, 0, 1)  # to CHW
 
     # Init model
     _logger.info("Done.\nInitialising model...")
@@ -50,6 +47,7 @@ def main(
         nca = GrowingNCA(
             hidden_size=12,
             perception_type=perception_type,
+            bound_updates=True,
             key=key
         )
         init_fn = partial(init_central_seed, shape=(nca.state_size, *target.shape[-2:]))
@@ -58,9 +56,9 @@ def main(
         nca = NoiseNCA(
             hidden_size=12,
             perception_type=perception_type,
+            bound_updates=True,
             key=key
         )
-
         init_fn = partial(init_random, shape=(nca.state_size, *target.shape[-2:]))
 
     else:
@@ -69,52 +67,84 @@ def main(
     # Setup training
     _logger.info("Done.\nSetting up training...")
 
-    optim = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        # optax.clip_by_block_rms(1.0),
-        optax.adamw(lr, b1=0.95, b2=0.9995),
-    )
-    opt_state = optim.init(eqx.filter(nca, eqx.is_array))
+    params, statics = eqx.partition(nca, eqx.is_array)
 
-    def compute_loss(
-        model: Callable,
-        batch: tuple[jax.Array, jax.Array],
+    # CMA
+    strat = es.CMA_ES(
+        population_size=256,
+        solution=params,
+    )
+    strat_params = strat.default_params.replace(std_init=0.01)  # type: ignore
+
+    # OpenES
+    # lr_schedule = optax.exponential_decay(
+    #     init_value=0.001,
+    #     transition_steps=evo_iters,
+    #     decay_rate=0.01,
+    # )
+    # std_schedule = optax.exponential_decay(
+    #     init_value=0.01,
+    #     transition_steps=evo_iters,
+    #     decay_rate=1.0,
+    # )
+
+    # algo = Open_ES(
+    #     population_size=pop_size,
+    #     solution=params,
+    #     optimizer=optax.adam(learning_rate=lr_schedule),
+    #     std_schedule=optax.constant_schedule(0.01),
+    # )
+    # strat_params = strat.default_params
+
+    evo_state = strat.init(key, params, strat_params)
+
+    def compute_fitness(
+        params: Callable,
+        target: Float[Array, "CHW"],
         key: jax.Array
     ):
-        inputs, targets = batch
-        batch_key = jr.split(key, targets.shape[0])
-        preds, _ = jax.vmap(model)(inputs, key=batch_key)
-        return jnp.sum(optax.l2_loss(preds, targets)) / len(targets)
-
+        init_key, eval_key = jr.split(key)
+        init_state = init_fn(key=init_key)
+        preds, _ = eqx.combine(params, statics)(init_state, key=eval_key)
+        return jnp.sum((jnp.clip(preds, min=0.0, max=1.0) - target) ** 2)
 
     @eqx.filter_jit
-    def train_step(
-        model: PyTree,
-        batch: tuple[Float[Array, "NCHW"], Float[Array, "NCHW"]],
-        opt_state: PyTree,
+    def evo_step(
+        evo_state: PyTree,
+        target: Float[Array, "CHW"],
         key: jax.Array,
     ):
-        loss_value, grads = eqx.filter_value_and_grad(compute_loss)(model, batch, key)
-        updates, opt_state = optim.update(grads, opt_state, model)
-        model = eqx.apply_updates(model, updates)
-        return loss_value, model, opt_state
+        ask_key, eval_key, tell_key = jr.split(key, 3)
+        candidates, evo_state = strat.ask(ask_key, evo_state, strat_params)
+        fitness = jax.vmap(compute_fitness, in_axes=(0, None, 0))(
+            candidates, target, jr.split(eval_key, pop_size)
+        )
+        evo_state, _ = strat.tell(tell_key, candidates, fitness, evo_state, strat_params)
+        metrics= {
+            'mean_fitness': fitness.mean(),
+            'best_fitness': fitness.min(),
+            'best_fitnees_ever': evo_state.best_fitness,
+        }
+        return evo_state, metrics
 
     # Train
-    _logger.info("Done.\nTraining starting...")
+    _logger.info("Done.\nEvolution starting...")
 
-    for i in (pbar := tqdm(range(train_iters))):
+    for i in (pbar := tqdm(range(evo_iters))):
         key, step_key = jr.split(key)
         # NOTE: Use lambda to vmap over keys since these are keyword parameters.
-        init_state = jax.vmap(lambda k: init_fn(key=k))(jr.split(step_key, len(target)))
-        train_loss, nca, opt_state = train_step(nca, (init_state, target), opt_state, step_key)
+        evo_state, metrics = evo_step(evo_state, target, step_key)
+        pbar.set_postfix_str(
+           f"iter: {i}; mean fitneess: {float(metrics['mean_fitness'])}")
 
-        pbar.set_postfix_str(f"iter: {i}; loss: {np.asarray(train_loss)}")
-
-    # evaluating the model
+    # Evaluating the best individual
+    _logger.info("Done.\nEvaluating the best individual...")
+    nca = eqx.combine(evo_state.best_solution, statics)
     output, dev_path = nca(init_fn(key=key), steps=96, key=key)
 
     # Save results
     _logger.info("Saving results...")
+
     save_folder = Path(save_folder)
     os.makedirs(save_folder, exist_ok=True)
 
@@ -124,34 +154,33 @@ def main(
 
     _logger.info("Done.\nScript terminating.")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument(
+    parser. add_argument(
         "--model",
         choices=['NCA', 'noiseNCA', 'mNCA'],
         default='NCA',
     )
     parser.add_argument(
         "--perception_type",
-        choices=['sobel', 'laplace', 'sobel-with-laplace', 'steerable', 'steerable-with-laplace'],
+        choices=['sobel', 'sobel-with-laplace'],
         default='sobel',
     )
     parser.add_argument(
         "--target",
         type=str,
-        default="salamander",
+        default="salamander",  # 1984
     )
     parser.add_argument(
-        "--train_iters",
+        "--evo_iters",
         type=int,
         default=5000,
     )
     parser.add_argument(
-        "--lr",
+        "--pop_size",
         type=float,
-        default=1e-3
+        default=256,
     )
     parser.add_argument(
         "--save_folder",
