@@ -4,11 +4,12 @@ import logging
 from pathlib import Path
 from functools import partial
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 import jax.random as jr
 import equinox as eqx
-import optax
+# import optax
 import evosax.algorithms as es
 from tqdm import tqdm
 from typing import Callable
@@ -29,6 +30,8 @@ def main(
     model: str,
     perception_type: str,
     target,
+    target_size: int,
+    target_pad: int,
     evo_iters: int,
     pop_size: float,
     save_folder: Path,
@@ -38,7 +41,8 @@ def main(
 
     # Set training data
     _logger.info("Loading target example...")
-    target = load_emoji(Emoji[target.upper()].value, 64).transpose(2, 0, 1)  # to CHW
+    target = load_emoji(Emoji[target.upper()].value, target_size).transpose(2, 0, 1)  # to CHW
+    target = np.pad(target, ((0, 0), (target_pad, target_pad), (target_pad, target_pad)))
 
     # Init model
     _logger.info("Done.\nInitialising model...")
@@ -70,10 +74,7 @@ def main(
     params, statics = eqx.partition(nca, eqx.is_array)
 
     # CMA
-    strat = es.CMA_ES(
-        population_size=256,
-        solution=params,
-    )
+    strat = es.CMA_ES(population_size=256, solution=params)
     strat_params = strat.default_params.replace(std_init=0.01)  # type: ignore
 
     # OpenES
@@ -132,10 +133,8 @@ def main(
 
     for i in (pbar := tqdm(range(evo_iters))):
         key, step_key = jr.split(key)
-        # NOTE: Use lambda to vmap over keys since these are keyword parameters.
         evo_state, metrics = evo_step(evo_state, target, step_key)
-        pbar.set_postfix_str(
-           f"iter: {i}; mean fitneess: {float(metrics['mean_fitness'])}")
+        pbar.set_postfix_str( f"iter: {i}; mean fitneess: {float(metrics['mean_fitness'])}")
 
     # Evaluating the best individual
     _logger.info("Done.\nEvaluating the best individual...")
@@ -171,6 +170,16 @@ if __name__ == "__main__":
         "--target",
         type=str,
         default="salamander",  # 1984
+    )
+    parser.add_argument(
+        "--target_size",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--target_size",
+        type=int,
+        default=2,
     )
     parser.add_argument(
         "--evo_iters",
